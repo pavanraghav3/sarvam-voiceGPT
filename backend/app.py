@@ -6,23 +6,23 @@ import wave
 import contextlib
 import subprocess
 import tempfile
+import base64
+import datetime
 from pathlib import Path
 from dotenv import load_dotenv
 from io import BytesIO
+from chat_routes import chat_bp
+from db import create_new_chat, add_message_to_chat
+from sarvam_api import SarvamAPI
+from llm_api import LLM_API
 
 # Load environment variables first
 load_dotenv()
 
-# Add backend directory to Python path
-sys.path.append(str(Path(__file__).parent))
-
-# Import modules after setting up paths
-from sarvam_api import SarvamAPI
-from llm_api import LLM_API
-
 # Initialize Flask app
 app = Flask(__name__)
 CORS(app)
+app.register_blueprint(chat_bp)
 
 # ------ Helper Functions ------
 def is_valid_wav(file_storage):
@@ -42,19 +42,16 @@ def is_valid_wav(file_storage):
 def convert_to_wav(input_bytes):
     """Convert audio bytes to WAV using ffmpeg with detailed error logging."""
     try:
-        # Create temporary input/output files (no auto-delete)
         with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as temp_in, \
              tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_out:
 
-            # Write input bytes to temp file
             temp_in.write(input_bytes)
             temp_in.flush()
 
-            # Run FFmpeg command
             result = subprocess.run(
                 [
                     'ffmpeg',
-                    '-y',  # Overwrite output
+                    '-y',
                     '-i', temp_in.name,
                     '-acodec', 'pcm_s16le',
                     '-ar', '16000',
@@ -62,15 +59,13 @@ def convert_to_wav(input_bytes):
                     temp_out.name
                 ],
                 capture_output=True,
-                text=True  # Capture stderr as text
+                text=True
             )
 
-            # Check for errors
             if result.returncode != 0:
                 print(f"FFmpeg Error (stderr):\n{result.stderr}")
                 return None
 
-            # Read converted WAV bytes
             with open(temp_out.name, 'rb') as f:
                 return f.read()
 
@@ -78,7 +73,6 @@ def convert_to_wav(input_bytes):
         print(f"Conversion failed: {str(e)}")
         return None
     finally:
-        # Clean up temporary files
         if 'temp_in' in locals():
             os.unlink(temp_in.name)
         if 'temp_out' in locals():
@@ -97,70 +91,81 @@ llm_api = LLM_API()
 # ------ Routes ------
 @app.route('/')
 def home():
-    """Basic homepage route"""
     return "<h1>Backend is running</h1><p>Use /process-voice endpoint for voice interactions</p>"
 
 @app.route('/process-voice', methods=['POST'])
 def process_voice():
     try:
-        print("Request.files:", request.files)
         audio_file = request.files.get('file')
-        if audio_file is None:
+        if not audio_file:
             return jsonify({"error": "No audio file provided"}), 400
 
-        # Read original file bytes
-        original_bytes = audio_file.read()
-        audio_file.stream.seek(0)  # Reset stream position
+        chat_id = request.form.get('chat_id') or create_new_chat()
+        print(f"🚀 Using chat: {chat_id}")
 
-        # Validate WAV format
+        # Process audio file
+        original_bytes = audio_file.read()
+        audio_file.stream.seek(0)
+
+        # Convert to WAV if needed
         if not is_valid_wav(audio_file):
             print("Attempting audio conversion...")
             converted_bytes = convert_to_wav(original_bytes)
             if not converted_bytes:
-                return jsonify({"error": "Failed to convert audio to WAV format"}), 400
-            # Create new file-like object with converted audio
+                return jsonify({"error": "Conversion failed"}), 400
             audio_file = BytesIO(converted_bytes)
-            audio_file.name = "audio.wav"  # Set filename for Sarvam API
+            audio_file.name = "audio.wav"
 
-        # Hardcode language to Indian English
-        language_code = 'en-IN'
+        # Get user audio for storage
+        audio_file.seek(0)
+        user_audio_bytes = audio_file.read()
+        user_audio_base64 = base64.b64encode(user_audio_bytes).decode('utf-8')
 
-        # Process speech-to-text
+        # Speech-to-text
         audio_file.seek(0)
         stt_response = sarvam_api.speech_to_text(audio_file)
-        print("STT Response:", stt_response)
-
         if "error" in stt_response:
             return jsonify(stt_response), 500
 
         transcript = stt_response.get("transcript")
         if not transcript:
-            return jsonify({"error": "No transcript returned from STT"}), 500
+            return jsonify({"error": "No transcript returned"}), 500
 
-        # Process LLM response
+        # Store user message with audio
+        add_message_to_chat(chat_id, "user", {
+            "text": transcript,
+            "audio": user_audio_base64,
+            "timestamp": datetime.datetime.utcnow()
+        })
+
+        # Get LLM response
         llm_response = llm_api.get_response(transcript)
-        print("LLM Response:", llm_response)
-
         if isinstance(llm_response, dict) and "error" in llm_response:
             return jsonify(llm_response), 500
 
-        # Process text-to-speech
-        audio_base64 = sarvam_api.text_to_speech(llm_response, 'en-IN')
-        print("TTS Response:", audio_base64)
+        # Store assistant response
+        add_message_to_chat(chat_id, "assistant", {
+            "text": llm_response,
+            "timestamp": datetime.datetime.utcnow()
+        })
 
-        if isinstance(audio_base64, dict) and "error" in audio_base64:
-            return jsonify(audio_base64), 500
+        # Text-to-speech with detected language
+        language_code = stt_response.get("language_code", "en-IN")
+        tts_response = sarvam_api.text_to_speech(llm_response, language_code)
+        if isinstance(tts_response, dict) and "error" in tts_response:
+            return jsonify(tts_response), 500
 
         return jsonify({
+            "chatId": chat_id,
             "userText": transcript,
+            "userAudio": user_audio_base64,
             "responseText": llm_response,
-            "responseAudio": audio_base64,
+            "responseAudio": tts_response,
             "languageCode": language_code
         })
 
     except Exception as e:
-        import traceback
-        print("Exception in /process-voice:", traceback.format_exc())
+        print(f"Exception in /process-voice: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':

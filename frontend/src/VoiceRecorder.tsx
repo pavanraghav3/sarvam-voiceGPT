@@ -1,16 +1,28 @@
 import React, { useState, useRef } from "react";
 import axios from "axios";
 
-const VoiceRecorder: React.FC = () => {
+interface Message {
+  role: "user" | "assistant";
+  content: string;
+  timestamp: string;
+  audio?: string; // Optional base64 audio string
+}
+
+interface VoiceRecorderProps {
+  chatId: string | null;
+  onNewMessages: (userMsg: Message, assistantMsg: Message) => void;
+  disabled?: boolean;
+}
+
+const VoiceRecorder: React.FC<VoiceRecorderProps> = ({ chatId, onNewMessages, disabled = false }) => {
   const [isRecording, setIsRecording] = useState<boolean>(false);
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
-  const [userText, setUserText] = useState<string>("");
-  const [responseText, setResponseText] = useState<string>("");
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
   const startRecording = async () => {
+    if (disabled) return;
     audioChunksRef.current = [];
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -49,6 +61,7 @@ const VoiceRecorder: React.FC = () => {
     const audioBlob = new Blob(audioChunksRef.current, { type: "audio/wav" });
     const formData = new FormData();
     formData.append("file", audioBlob);
+    if (chatId) formData.append("chat_id", chatId);
 
     try {
       const response = await axios.post(
@@ -57,10 +70,24 @@ const VoiceRecorder: React.FC = () => {
       );
       const data = response.data;
 
-      setUserText(data.userText);
-      setResponseText(data.responseText);
+      // Build message objects with audio
+      const userMsg: Message = {
+        role: "user",
+        content: data.userText,
+        timestamp: new Date().toISOString(),
+        audio: data.userAudio, // <-- include user audio
+      };
+      const assistantMsg: Message = {
+        role: "assistant",
+        content: data.responseText,
+        timestamp: new Date().toISOString(),
+        audio: data.responseAudio, // <-- include assistant TTS audio
+      };
 
-      // Create audio from base64 string
+      // Update chat in parent
+      onNewMessages(userMsg, assistantMsg);
+
+      // Play assistant's audio
       const audioSrc = `data:audio/wav;base64,${data.responseAudio}`;
       if (audioRef.current) {
         audioRef.current.src = audioSrc;
@@ -75,38 +102,17 @@ const VoiceRecorder: React.FC = () => {
 
   return (
     <div className="voice-recorder-container">
-      <h2>Voice Chat Assistant</h2>
-
-      <div className="controls">
+      <div className="voice-btn-center">
         <button
           onClick={isRecording ? stopRecording : startRecording}
-          disabled={isProcessing}
-          className={isRecording ? "stop-btn" : "record-btn"}
+          disabled={isProcessing || disabled}
+          className={`voice-btn ${isRecording ? "recording" : ""}`}
         >
           {isRecording ? "Stop Recording" : "Start Recording"}
         </button>
-
+        {isRecording && <div className="recording-sign">Recording...</div>}
         {isProcessing && <p>Processing your request...</p>}
       </div>
-
-      <div className="conversation">
-        {userText && (
-          <div className="message user-message">
-            <p>
-              <strong>You:</strong> {userText}
-            </p>
-          </div>
-        )}
-
-        {responseText && (
-          <div className="message assistant-message">
-            <p>
-              <strong>Assistant:</strong> {responseText}
-            </p>
-          </div>
-        )}
-      </div>
-
       <audio ref={audioRef} style={{ display: "none" }} />
     </div>
   );
